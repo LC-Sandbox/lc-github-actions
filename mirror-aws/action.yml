@@ -31,4 +31,4 @@ runs:
         CODECOMMIT_REPOSITORY: ${{ inputs.codecommit-repository }}
         GH_TOKEN: ${{ github.token }}
       run: |
-        "$GITHUB_ACTION_PATH/mirror.sh"
+        bash "$GITHUB_ACTION_PATH/mirror.sh"
