@@ -49,8 +49,9 @@ github_url="https://github.com/${REPOSITORY}.git"
 # Perform a bare mirror clone to fetch all refs without creating
 # a working tree. Use an HTTP authorization header rather than
 # embedding the token in the repository URL.
+auth="$(printf 'x-access-token:%s' "$GH_TOKEN" | base64 | tr -d '\n')"
 git \
-  -c "http.https://github.com/.extraheader=AUTHORIZATION: bearer ${GH_TOKEN}" \
+  -c "http.extraHeader=Authorization: Basic ${auth}" \
   clone --mirror "$github_url" "$workdir/repo.git"
 
 cd "$workdir/repo.git"
