@@ -17,6 +17,9 @@ inputs:
   exclude-paths:
     required: false
     default: ""
+  
+  github-token:
+    required: true
 
 runs:
   using: composite
