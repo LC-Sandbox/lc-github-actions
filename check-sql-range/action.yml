@@ -1,0 +1,33 @@
+name: Check SQL Range
+description: Check changed SQL files for disallowed DROP/ALTER commands without checkout
+
+inputs:
+  branch:
+    description: Branch to validate
+    required: true
+
+  db-type:
+    description: Database type, e.g. SPI, ARH
+    required: true
+    
+  utf8-bom-check:
+    required: false
+    default: "false"
+
+  exclude-paths:
+    required: false
+    default: ""
+
+runs:
+  using: composite
+  steps:
+    - name: Check SQL files through GitHub API
+      shell: bash
+      env:
+        GH_TOKEN: ${{ inputs.github-token }}
+        EXCLUDE_PATHS: ${{ inputs.exclude-paths }}
+        UTF8_BOM_CHECK: ${{ inputs.utf8-bom-check }}
+        REPOSITORY: ${{ github.repository }}
+        BRANCH_NAME: ${{ inputs.branch }}
+        DB_TYPE: ${{ inputs.db-type }}
+      run: bash "$GITHUB_ACTION_PATH/check-sql.sh"
