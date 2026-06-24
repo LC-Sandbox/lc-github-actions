@@ -40,12 +40,24 @@ required_vars=(GH_TOKEN REPOSITORY BRANCH_NAME DB_TYPE)
 
 for var in "${required_vars[@]}"; do
   if [[ -z "${!var:-}" ]]; then
-    echo "::error::Required environment variable '$var' is not set."
+    echo "::error::Required environment variable '$var' is not set." >&2
     exit 1
   fi
 done
 
-# Call GitHub REST API and return JSON.
+# Function: api_get
+#
+# Description:
+#   Executes a GitHub REST API GET request and returns the JSON response.
+#
+# Parameters:
+#   url - Fully qualified GitHub API URL.
+#
+# Returns:
+#   JSON response through stdout.
+#
+# Example:
+#   api_get "https://api.github.com/repos/org/repo/branches/master"
 api_get() {
   curl -fsSL \
     -H "Authorization: Bearer $GH_TOKEN" \
@@ -54,7 +66,19 @@ api_get() {
     "$1"
 }
 
-# Fetch raw file content from GitHub.
+# Function: api_get_raw
+#
+# Description:
+#   Downloads raw file contents from GitHub using the Contents API.
+#
+# Parameters:
+#   url - Fully qualified GitHub API URL.
+#
+# Returns:
+#   Raw file contents through stdout.
+#
+# Example:
+#   api_get_raw "https://api.github.com/repos/org/repo/contents/test.sql?ref=<sha>"
 api_get_raw() {
   curl -fsSL \
     -H "Authorization: Bearer $GH_TOKEN" \
@@ -63,33 +87,78 @@ api_get_raw() {
     "$1"
 }
 
-# URL-encode a repository path, branch, or tag reference.
+# Function: url_encode_path
+#
+# Description:
+#   URL-encodes a string for safe use inside GitHub API URLs.
+#
+# Parameters:
+#   value - String to encode.
+#
+# Returns:
+#   URL-encoded string.
+#
+# Example:
+#   url_encode_path "tags/v7.00.05.00_db"
+#
+# Result:
+#   tags%2Fv7.00.05.00_db
 url_encode_path() {
   jq -rn --arg v "$1" '$v|@uri'
 }
 
-# Resolve the HEAD commit SHA of a branch.
+# Function: resolve_branch_sha
+#
+# Description:
+#   Resolves the current HEAD commit SHA for a GitHub branch.
+#
+# Parameters:
+#   branch - Branch name.
+#
+# Returns:
+#   Branch HEAD commit SHA.
 resolve_branch_sha() {
   local branch="$1"
-  local encoded_branch
+  local encoded_branch response sha
 
   encoded_branch="$(url_encode_path "$branch")"
+  response="$(api_get "https://api.github.com/repos/$REPOSITORY/branches/$encoded_branch")"
+  sha="$(echo "$response" | jq -r '.commit.sha // empty')"
 
-  api_get "https://api.github.com/repos/$REPOSITORY/branches/$encoded_branch" |
-    jq -r '.commit.sha'
+  if [[ -z "$sha" || "$sha" == "null" ]]; then
+    echo "::error::Could not resolve HEAD SHA for branch '$branch'." >&2
+    exit 1
+  fi
+
+  echo "$sha"
 }
 
-# Resolve a Git tag to the commit SHA it points to.
-# Supports both lightweight and annotated tags.
+# Function: resolve_tag_sha
+#
+# Description:
+#   Resolves the commit SHA referenced by a Git tag.
+#
+#   Supports both lightweight and annotated tags.
+#
+# Parameters:
+#   tag - Tag name.
+#
+# Returns:
+#   Commit SHA referenced by the tag.
 resolve_tag_sha() {
   local tag="$1"
-  local encoded_ref response object_type object_sha
+  local encoded_ref response object_type object_sha tag_response commit_sha
 
   encoded_ref="$(url_encode_path "tags/$tag")"
-
   response="$(api_get "https://api.github.com/repos/$REPOSITORY/git/ref/$encoded_ref")"
-  object_type="$(echo "$response" | jq -r '.object.type')"
-  object_sha="$(echo "$response" | jq -r '.object.sha')"
+
+  object_type="$(echo "$response" | jq -r '.object.type // empty')"
+  object_sha="$(echo "$response" | jq -r '.object.sha // empty')"
+
+  if [[ -z "$object_type" || -z "$object_sha" || "$object_type" == "null" || "$object_sha" == "null" ]]; then
+    echo "::error::Could not resolve tag '$tag'." >&2
+    exit 1
+  fi
 
   if [[ "$object_type" == "commit" ]]; then
     echo "$object_sha"
@@ -97,69 +166,151 @@ resolve_tag_sha() {
   fi
 
   if [[ "$object_type" == "tag" ]]; then
-    api_get "https://api.github.com/repos/$REPOSITORY/git/tags/$object_sha" |
-      jq -r '.object.sha'
+    tag_response="$(api_get "https://api.github.com/repos/$REPOSITORY/git/tags/$object_sha")"
+    commit_sha="$(echo "$tag_response" | jq -r '.object.sha // empty')"
+
+    if [[ -z "$commit_sha" || "$commit_sha" == "null" ]]; then
+      echo "::error::Could not resolve annotated tag '$tag' to commit SHA." >&2
+      exit 1
+    fi
+
+    echo "$commit_sha"
     return
   fi
 
-  echo "::error::Unsupported tag object type '$object_type' for tag '$tag'."
+  echo "::error::Unsupported tag object type '$object_type' for tag '$tag'." >&2
   exit 1
 }
 
-# Fetch a file from the repository at a specific ref/SHA.
+# Function: fetch_file
+#
+# Description:
+#   Retrieves raw file contents from the repository at the specified
+#   commit SHA, branch, or tag reference.
+#
+# Parameters:
+#   path - Repository-relative file path.
+#   ref  - Commit SHA, branch, or tag.
+#
+# Returns:
+#   Raw file contents through stdout.
+#
+# Example:
+#   fetch_file "Database/Scripts/SPI/Test.sql" "a92204c..."
 fetch_file() {
   local path="$1"
   local ref="$2"
-  local encoded_path
+  local encoded_path encoded_ref
 
   encoded_path="$(url_encode_path "$path")"
-  api_get_raw "https://api.github.com/repos/$REPOSITORY/contents/$encoded_path?ref=$ref"
+  encoded_ref="$(url_encode_path "$ref")"
+
+  api_get_raw "https://api.github.com/repos/$REPOSITORY/contents/$encoded_path?ref=$encoded_ref"
 }
 
-# Resolve daily baseline SHA from Izvrseno.json.
+# Function: resolve_daily_from_sha
 #
-# The file is fetched from:
-#   Database/Scripts/<DB_TYPE>/DnevnaNadogradnja/Izvrseno.json
+# Description:
+#   Resolves the baseline commit SHA for a daily (master) build.
 #
-# at the target branch HEAD commit.
+#   The baseline is stored in:
 #
-# Expected JSON format:
-# {
-#   "gitCommitHash": "<sha>",
-#   ...
-# }
+#     Database/Scripts/<DB_TYPE>/DnevnaNadogradnja/Izvrseno.json
+#
+#   The file is fetched from the current branch HEAD commit and the
+#   value of property "gitCommitHash" is used as the comparison start
+#   point.
+#
+#   Example:
+#     Current master HEAD:
+#       395d8fb...
+#
+#     Izvrseno.json:
+#       {
+#         "gitCommitHash": "a92204c..."
+#       }
+#
+#     Result:
+#       a92204c...
+#
+# Parameters:
+#   to_sha - Current branch HEAD commit SHA.
+#
+# Returns:
+#   Baseline commit SHA from Izvrseno.json.
+#
+# Errors:
+#   Fails if Izvrseno.json cannot be fetched or does not contain
+#   a valid gitCommitHash value.
 resolve_daily_from_sha() {
   local to_sha="$1"
   local path="Database/Scripts/${DB_TYPE}/DnevnaNadogradnja/Izvrseno.json"
   local tmp="/tmp/izvrseno.json"
   local from_sha
 
-  echo "Resolving daily baseline from '$path' at '$to_sha'..."
+  echo "Resolving daily baseline from '$path' at '$to_sha'..." >&2
 
   if ! fetch_file "$path" "$to_sha" > "$tmp"; then
-    echo "::error::Could not fetch '$path' at '$to_sha'."
+    echo "::error::Could not fetch '$path' at '$to_sha'." >&2
     exit 1
   fi
 
   from_sha="$(jq -r '.gitCommitHash // empty' "$tmp")"
 
   if [[ -z "$from_sha" || "$from_sha" == "null" ]]; then
-    echo "::error::Could not resolve gitCommitHash from '$path'."
+    echo "::error::Could not resolve gitCommitHash from '$path'." >&2
     exit 1
   fi
 
   echo "$from_sha"
 }
 
-# List changed SQL files between two commits.
-# Output format:
-#   <to_sha>\t<filename>
+# Function: get_changed_sql_files_range
+#
+# Description:
+#   Lists all SQL files changed between two commits using the GitHub
+#   Compare API.
+#
+#   The comparison includes the entire commit range:
+#
+#     from_sha ... to_sha
+#
+#   Removed and renamed files are ignored because only files that
+#   currently exist at the target revision can be validated.
+#
+#   Returned entries always use to_sha as the file reference because
+#   validation is performed against the final file contents that exist
+#   at the end of the range.
+#
+# Parameters:
+#   from_sha - Baseline commit SHA.
+#   to_sha   - Target commit SHA.
+#
+# Output:
+#   One line per SQL file:
+#
+#     <to_sha>\t<filename>
+#
+# Example:
+#   395d8fb...    Database/Scripts/SPI/Test.sql
+#
+# Returns:
+#   Changed SQL files between the two commits.
+#
+# Errors:
+#   Fails if the GitHub Compare API returns an error.
 get_changed_sql_files_range() {
   local from_sha="$1"
   local to_sha="$2"
-  local response
+  local response message
 
   response="$(api_get "https://api.github.com/repos/$REPOSITORY/compare/$from_sha...$to_sha")"
+
+  message="$(echo "$response" | jq -r '.message // empty')"
+  if [[ -n "$message" ]]; then
+    echo "::error::GitHub compare API failed: $message" >&2
+    exit 1
+  fi
 
   echo "$response" |
     jq -r --arg ref "$to_sha" '
@@ -169,34 +320,63 @@ get_changed_sql_files_range() {
     '
 }
 
-# Check whether a file starts with UTF-8 BOM bytes: EF BB BF.
+# Function: has_utf8_bom
+#
+# Description:
+#   Checks whether a file begins with the UTF-8 BOM sequence:
+#
+#     EF BB BF
+#
+# Parameters:
+#   file - Path to local file.
+#
+# Returns:
+#   0 if BOM exists.
+#   1 otherwise.
 has_utf8_bom() {
   [[ "$(head -c 3 "$1" | od -An -tx1 | tr -d ' ')" == "efbbbf" ]]
 }
 
-# Return success if SQL contains disallowed DROP or ALTER after sanitization.
+# Function: is_sql_file_containing_disallowed_command
+#
+# Description:
+#   Checks whether a SQL file contains disallowed DROP or ALTER commands.
+#
+#   Before checking, the SQL content is sanitized by removing:
+#     - block comments
+#     - line comments
+#     - string literals
+#
+#   The following patterns are explicitly allowed:
+#     - DROP TABLE on temporary tables
+#     - ALTER TABLE on temporary tables
+#     - GRANT ALTER ON
+#     - ALTER COLUMN
+#     - ADD CONSTRAINT
+#     - CHECK/NOCHECK CONSTRAINT
+#     - DROP CONSTRAINT
+#     - ENABLE/DISABLE TRIGGER
+#
+# Parameters:
+#   file - Local SQL file path.
+#
+# Returns:
+#   0 if disallowed DROP/ALTER is detected.
+#   1 otherwise.
 is_sql_file_containing_disallowed_command() {
   local file="$1"
 
   perl -0777 -pe '
-    # Remove block comments: /* ... */
     s|/\*.*?\*/||gis;
-
-    # Remove line comments: -- ...
     s|--.*$||gm;
-
-    # Remove single-quoted strings.
     s|'\''[^'\'']*'\''||g;
 
-    # Allow DROP/ALTER on temp tables.
     s|drop\s*table\s*(\[?dbo\]?\.)?\[?#\w+\]?||gi;
     s|alter\s*table\s*(\[?dbo\]?\.)?\[?#\w+\]?\s*drop||gi;
     s|alter\s*table\s*(\[?dbo\]?\.)?\[?#\w+\]?||gi;
 
-    # Allow GRANT ALTER ON.
     s|grant\s*alter\s*on||gi;
 
-    # Allow known-safe ALTER TABLE forms.
     s|ALTER\s*TABLE\s*(\[?dbo\]?\.)?\s*(\[?\w+\]?\.?)+\s*ALTER\s*COLUMN||gis;
     s|ALTER\s*TABLE\s*(\[?dbo\]?\.)?\s*(\[?\w+\]?\.?)+\s*ADD\s*CONSTRAINT||gis;
     s|ALTER\s*TABLE\s*(\[?dbo\]?\.)?\s*(\[?\w+\]?\.?)+\s*WITH\s*CHECK\s*ADD\s*CONSTRAINT||gis;
@@ -228,10 +408,8 @@ echo "Mode: $MODE"
 echo "From SHA: $FROM_SHA"
 echo "To SHA:   $TO_SHA"
 
-# Get changed SQL files before fetching file contents.
 mapfile -t entries < <(get_changed_sql_files_range "$FROM_SHA" "$TO_SHA" | sort -u)
 
-# Apply optional path exclusions before fetching file contents.
 if [[ -n "$EXCLUDE_PATHS" && ${#entries[@]} -gt 0 ]]; then
   exclude_regex="$(echo "$EXCLUDE_PATHS" | sed 's/, */,/g; s/,/|/g')"
   mapfile -t entries < <(printf "%s\n" "${entries[@]}" | grep -vE "$exclude_regex" || true)
