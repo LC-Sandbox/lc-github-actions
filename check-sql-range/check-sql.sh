@@ -6,7 +6,7 @@ set -euo pipefail
 #
 # Purpose:
 #   Validate SQL files changed between a baseline and a target branch state
-#   without checking out the repository.
+#   for a specific database type without checking out the repository.
 #
 # Flow:
 #   1. Resolve target SHA from BRANCH_NAME.
@@ -14,7 +14,9 @@ set -euo pipefail
 #        - master       -> commit from Izvrseno.json
 #        - other branch -> tag v<BRANCH_NAME>_db
 #   3. Compare baseline SHA and target SHA through GitHub REST API.
-#   4. Keep changed .sql files, excluding removed/renamed files.
+#   4. Keep changed .sql files:
+#        - excluding removed/renamed files
+#        - limited to Database/Scripts/<DB_TYPE>/
 #   5. Apply optional path exclusions.
 #   6. Exit successfully if no SQL files remain.
 #   7. Fetch remaining SQL files at the target SHA.
@@ -268,12 +270,16 @@ resolve_daily_from_sha() {
 # Function: get_changed_sql_files_range
 #
 # Description:
-#   Lists all SQL files changed between two commits using the GitHub
+#   Lists changed SQL files between two commits using the GitHub
 #   Compare API.
 #
 #   The comparison includes the entire commit range:
 #
 #     from_sha ... to_sha
+#
+#   Only SQL files belonging to the selected database type are returned:
+#
+#     Database/Scripts/<DB_TYPE>/
 #
 #   Removed and renamed files are ignored because only files that
 #   currently exist at the target revision can be validated.
@@ -292,10 +298,10 @@ resolve_daily_from_sha() {
 #     <to_sha>\t<filename>
 #
 # Example:
-#   395d8fb...    Database/Scripts/SPI/Test.sql
+#   395d8fb...    Database/Scripts/SPI/DatabaseObjects/Test.sql
 #
 # Returns:
-#   Changed SQL files between the two commits.
+#   Changed SQL files for the selected DB_TYPE between the two commits.
 #
 # Errors:
 #   Fails if the GitHub Compare API returns an error.
@@ -313,9 +319,11 @@ get_changed_sql_files_range() {
   fi
 
   echo "$response" |
-    jq -r --arg ref "$to_sha" '
+    jq -r --arg ref "$to_sha" --arg db_type "$DB_TYPE" '
       .files[]
-      | select((.status != "removed") and (.status != "renamed") and (.filename | endswith(".sql")))
+      | select((.status != "removed") and (.status != "renamed"))
+      | select(.filename | endswith(".sql"))
+      | select(.filename | startswith("Database/Scripts/" + $db_type + "/"))
       | "\($ref)\t\(.filename)"
     '
 }
@@ -405,6 +413,7 @@ else
 fi
 
 echo "Mode: $MODE"
+echo "Database scope: Database/Scripts/${DB_TYPE}/"
 echo "From SHA: $FROM_SHA"
 echo "To SHA:   $TO_SHA"
 
